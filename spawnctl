@@ -1,0 +1,243 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Configuration
+readonly SCRIPT_NAME=$(basename "$0")
+readonly DEFAULT_SHELL="/bin/zsh"
+readonly MIN_USER_UID=1000
+readonly PROTECTED_USERS="root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats nobody systemd-network systemd-resolve systemd-timesync messagebus syslog _apt"
+
+# Simple logging
+log() {
+  echo "$*"
+}
+
+die() {
+  echo -e "\033[0;31m$*\033[0m" >&2
+  exit 1
+}
+
+show_help() {
+  cat << EOF
+${SCRIPT_NAME} - User management for development environments
+
+USAGE:
+  sudo ${SCRIPT_NAME} --create USERNAME --manager MANAGER_USER [OPTIONS]
+  sudo ${SCRIPT_NAME} --remove USERNAME [OPTIONS]
+
+ACTIONS:
+  --create               Create a new user (requires --manager)
+  --remove               Remove an existing user
+
+OPTIONS:
+  -h, --help            Show this help message
+  -s, --shell SHELL     Set custom shell (default: ${DEFAULT_SHELL})
+  -g, --groups GROUPS   Additional groups (comma-separated)
+  -m, --manager USER    Manager user whose SSH key will be added
+  -f, --force           Skip confirmation prompts
+
+EXAMPLES:
+  sudo ${SCRIPT_NAME} --create dev-alice --manager john
+  sudo ${SCRIPT_NAME} --create dev-bob -s /bin/bash -g docker -m mary
+  sudo ${SCRIPT_NAME} --remove dev-alice
+
+EOF
+}
+
+# Check prerequisites
+check_prerequisites() {
+  [[ $EUID -eq 0 ]] || die "This script must be run as root"
+  command -v useradd &>/dev/null || die "useradd command not found"
+  command -v ssh-keygen &>/dev/null || die "ssh-keygen command not found"
+}
+
+# Validate username
+validate_username() {
+  local username=$1
+  [[ -n "$username" ]] || die "Username is required"
+  [[ "$username" =~ ^[a-z][a-z0-9-]*[a-z0-9]$ ]] || die "Invalid username format"
+}
+
+# Check if user is protected
+is_protected_user() {
+  local username=$1
+  for protected in $PROTECTED_USERS; do
+    [[ "$username" == "$protected" ]] && return 0
+  done
+  if id "$username" &>/dev/null; then
+    local uid=$(id -u "$username")
+    [[ $uid -lt $MIN_USER_UID ]] && return 0
+  fi
+  return 1
+}
+
+# Create user
+create_user() {
+  local username=$1
+  local home="/home/$username"
+  local manager_user=$4
+  local manager_key=""
+  local manager_home=$(getent passwd "$manager_user" | cut -d: -f6)
+  local shell=$2
+  local groups=$3
+
+  # Validate inputs
+  validate_username "$username"
+  id "$username" &>/dev/null && die "User '$username' already exists"
+  id "$manager_user" &>/dev/null || die "Manager user '$manager_user' does not exist"
+  
+  # Find manager's SSH key
+  log "Looking for manager's SSH key..."
+  for key in "$manager_home"/.ssh/id_*.pub; do
+    if [[ -f "$key" ]]; then
+      manager_key="$key"
+      log "Found SSH key: $key"
+      break
+    fi
+  done
+  [[ -n "$manager_key" ]] || die "No SSH key found for manager user '$manager_user'"
+
+  log "Creating user '$username'..."
+
+  # Create user
+  local cmd=(useradd -m -s "$shell")
+  [[ -n "$groups" ]] && cmd+=(-G "$groups")
+  cmd+=("$username")
+  
+  log "Running: ${cmd[*]}"
+  "${cmd[@]}" || die "Failed to create user"
+
+  # Setup SSH
+  log "Setting up SSH directory..."
+  mkdir -p "$home/.ssh"
+  chmod 700 "$home/.ssh"
+  
+  # Add manager's key
+  log "Adding manager's SSH key to authorized_keys..."
+  cp "$manager_key" "$home/.ssh/authorized_keys"
+  chmod 600 "$home/.ssh/authorized_keys"
+  
+  # Generate user's SSH key
+  log "Generating SSH keypair for user..."
+  ssh-keygen -t ed25519 -f "$home/.ssh/id_ed25519" -N '' -C "$username@$(date +%Y%m%d)" -q
+
+  # Copy configs from the manager
+  mkdir -p $home/.config
+  mkdir -p $home/.cache
+  mkdir -p $home/.local/bin
+  mkdir -p $home/.local/share
+  mkdir -p $home/.local/src
+
+  if [[ -d "$manager_home/.config/zsh" ]]; then
+    cp -R "$manager_home/.config/zsh" "$home/.config/" 2>/dev/null || \
+      die "Could not copy zsh config from manager user"
+  fi
+  
+  if [[ -d "$manager_home/.config/nvim" ]]; then
+    cp -R "$manager_home/.config/nvim" "$home/.config/" 2>/dev/null || \
+      die "Could not copy nvim config from manager user"
+  fi
+  
+  # Create shell profile directory
+  mkdir -p "$home/.config/shell"
+  touch "$home/.config/shell/profile"
+  
+  # Link login profile if dotfiles exist
+  if [[ -f "/var/dotfiles/zprofile" ]]; then
+    ln -s /var/dotfiles/zprofile "$home/.zprofile" 2>/dev/null || \
+      die "Could not link zprofile from /var/dotfiles"
+  fi
+  
+  # Install claude-code if npm is available
+  if command -v npm &>/dev/null; then
+    log "Installing claude-code..."
+    su - "$username" -c "npm install @anthropic-ai/claude-code" 2>/dev/null || \
+      die "Could not install claude-code"
+  fi
+  
+  # Fix ownership
+  log "Setting ownership for home directory..."
+  chown -R "$username:$username" "$home"
+}
+
+# Remove user
+remove_user() {
+  local username=$1
+  local force=$2
+  
+  validate_username "$username"
+  id "$username" &>/dev/null || die "User '$username' does not exist"
+  is_protected_user "$username" && die "Cannot remove protected user '$username'"
+  
+  if [[ "$force" != "true" ]]; then
+    echo -n "Remove user '$username' and ALL their data? Type 'yes' to confirm: "
+    read -r response
+    [[ "$response" == "yes" ]] || die "Operation cancelled"
+  fi
+  
+  log "Removing user '$username'..."
+  
+  # Kill user processes
+  log "Checking for running processes..."
+  if pgrep -u "$username" &>/dev/null; then
+    log "Killing user processes..."
+    pkill -u "$username" 2>/dev/null || true
+    sleep 1
+  fi
+  
+  # Remove user (suppress mail spool warning)
+  log "Deleting user and home directory..."
+  if ! userdel -r "$username" 2>&1 | grep -v "mail spool"; then
+    # Check if user still exists
+    if id "$username" &>/dev/null; then
+      die "Failed to remove user"
+    fi
+  fi
+  
+  log "User '$username' removed successfully"
+}
+
+# Main
+main() {
+  local action=""
+  local username=""
+  local shell="$DEFAULT_SHELL"
+  local groups=""
+  local manager_user=""
+  local force="false"
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -h|--help) show_help; exit 0 ;;
+      --create) action="create"; shift ;;
+      --remove) action="remove"; shift ;;
+      -s|--shell) shift; shell="$1"; shift ;;
+      -g|--groups) shift; groups="$1"; shift ;;
+      -m|--manager) shift; manager_user="$1"; shift ;;
+      -f|--force) force="true"; shift ;;
+      -*) die "Unknown option: $1" ;;
+      *) username="$1"; shift ;;
+    esac
+  done
+
+  check_prerequisites
+
+  case "$action" in
+    create)
+      [[ -n "$username" ]] || die "Username required"
+      [[ -n "$manager_user" ]] || die "Manager user required (--manager)"
+      create_user "$username" "$shell" "$groups" "$manager_user"
+      ;;
+    remove)
+      [[ -n "$username" ]] || die "Username required"
+      remove_user "$username" "$force"
+      ;;
+    *)
+      die "No action specified. Use --create or --remove"
+      ;;
+  esac
+}
+
+main "$@"
