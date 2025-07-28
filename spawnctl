@@ -171,9 +171,9 @@ remove_user() {
   is_protected_user "$username" && die "Cannot remove protected user '$username'"
   
   if [[ "$force" != "true" ]]; then
-    echo -n "Remove user '$username' and ALL their data? Type 'yes' to confirm: "
+    echo -n "Remove user '$username' and ALL their data? Type the username '$username' to confirm: "
     read -r response
-    [[ "$response" == "yes" ]] || die "Operation cancelled"
+    [[ "$response" == "$username" ]] || die "Operation cancelled - username did not match"
   fi
   
   log "Removing user '$username'..."
