@@ -23,23 +23,23 @@ show_help() {
 ${SCRIPT_NAME} - User management for development environments
 
 USAGE:
-  sudo ${SCRIPT_NAME} --create USERNAME --manager MANAGER_USER [OPTIONS]
+  sudo ${SCRIPT_NAME} --create USERNAME --parent PARENT_USER [OPTIONS]
   sudo ${SCRIPT_NAME} --remove USERNAME [OPTIONS]
 
 ACTIONS:
-  --create               Create a new user (requires --manager)
+  --create               Create a new user (requires --parent)
   --remove               Remove an existing user
 
 OPTIONS:
   -h, --help            Show this help message
   -s, --shell SHELL     Set custom shell (default: ${DEFAULT_SHELL})
   -g, --groups GROUPS   Additional groups (comma-separated)
-  -m, --manager USER    Manager user whose SSH key will be added
+  -p, --parent USER     Parent user whose SSH key will be added
   -f, --force           Skip confirmation prompts
 
 EXAMPLES:
-  sudo ${SCRIPT_NAME} --create dev-alice --manager john
-  sudo ${SCRIPT_NAME} --create dev-bob -s /bin/bash -g docker -m mary
+  sudo ${SCRIPT_NAME} --create dev-alice --parent john
+  sudo ${SCRIPT_NAME} --create dev-bob -s /bin/bash -g docker -p mary
   sudo ${SCRIPT_NAME} --remove dev-alice
 
 EOF
@@ -76,27 +76,27 @@ is_protected_user() {
 create_user() {
   local username=$1
   local home="/home/$username"
-  local manager_user=$4
-  local manager_key=""
-  local manager_home=$(getent passwd "$manager_user" | cut -d: -f6)
+  local parent_user=$4
+  local parent_key=""
+  local parent_home=$(getent passwd "$parent_user" | cut -d: -f6)
   local shell=$2
   local groups=$3
 
   # Validate inputs
   validate_username "$username"
   id "$username" &>/dev/null && die "User '$username' already exists"
-  id "$manager_user" &>/dev/null || die "Manager user '$manager_user' does not exist"
-  
-  # Find manager's SSH key
-  log "Looking for manager's SSH key..."
-  for key in "$manager_home"/.ssh/id_*.pub; do
+  id "$parent_user" &>/dev/null || die "Parent user '$parent_user' does not exist"
+
+  # Find parent's SSH key
+  log "Looking for parent's SSH key..."
+  for key in "$parent_home"/.ssh/id_*.pub; do
     if [[ -f "$key" ]]; then
-      manager_key="$key"
+      parent_key="$key"
       log "Found SSH key: $key"
       break
     fi
   done
-  [[ -n "$manager_key" ]] || die "No SSH key found for manager user '$manager_user'"
+  [[ -n "$parent_key" ]] || die "No SSH key found for parent user '$parent_user'"
 
   log "Creating user '$username'..."
 
@@ -104,7 +104,7 @@ create_user() {
   local cmd=(useradd -m -s "$shell")
   [[ -n "$groups" ]] && cmd+=(-G "$groups")
   cmd+=("$username")
-  
+
   log "Running: ${cmd[*]}"
   "${cmd[@]}" || die "Failed to create user"
 
@@ -112,50 +112,50 @@ create_user() {
   log "Setting up SSH directory..."
   mkdir -p "$home/.ssh"
   chmod 700 "$home/.ssh"
-  
-  # Add manager's key
-  log "Adding manager's SSH key to authorized_keys..."
-  cp "$manager_key" "$home/.ssh/authorized_keys"
+
+  # Add parent's key
+  log "Adding parent's SSH key to authorized_keys..."
+  cp "$parent_key" "$home/.ssh/authorized_keys"
   chmod 600 "$home/.ssh/authorized_keys"
-  
+
   # Generate user's SSH key
   log "Generating SSH keypair for user..."
   ssh-keygen -t ed25519 -f "$home/.ssh/id_ed25519" -N '' -C "$username@$(date +%Y%m%d)" -q
 
-  # Copy configs from the manager
+  # Copy configs from the parent
   mkdir -p $home/.config
   mkdir -p $home/.cache
   mkdir -p $home/.local/bin
   mkdir -p $home/.local/share
   mkdir -p $home/.local/src
 
-  if [[ -d "$manager_home/.config/zsh" ]]; then
-    cp -R "$manager_home/.config/zsh" "$home/.config/" 2>/dev/null || \
-      die "Could not copy zsh config from manager user"
+  if [[ -d "$parent_home/.config/zsh" ]]; then
+    cp -R "$parent_home/.config/zsh" "$home/.config/" 2>/dev/null || \
+      die "Could not copy zsh config from parent user"
   fi
-  
-  if [[ -d "$manager_home/.config/nvim" ]]; then
-    cp -R "$manager_home/.config/nvim" "$home/.config/" 2>/dev/null || \
-      die "Could not copy nvim config from manager user"
+
+  if [[ -d "$parent_home/.config/nvim" ]]; then
+    cp -R "$parent_home/.config/nvim" "$home/.config/" 2>/dev/null || \
+      die "Could not copy nvim config from parent user"
   fi
-  
+
   # Create shell profile directory
   mkdir -p "$home/.config/shell"
   touch "$home/.config/shell/profile"
-  
+
   # Link login profile if dotfiles exist
   if [[ -f "/var/dotfiles/zprofile" ]]; then
     ln -s /var/dotfiles/zprofile "$home/.zprofile" 2>/dev/null || \
       die "Could not link zprofile from /var/dotfiles"
   fi
-  
+
   # Install claude-code if npm is available
   if command -v npm &>/dev/null; then
     log "Installing claude-code..."
     su - "$username" -c "npm install @anthropic-ai/claude-code" 2>/dev/null || \
       die "Could not install claude-code"
   fi
-  
+
   # Fix ownership
   log "Setting ownership for home directory..."
   chown -R "$username:$username" "$home"
@@ -165,19 +165,19 @@ create_user() {
 remove_user() {
   local username=$1
   local force=$2
-  
+
   validate_username "$username"
   id "$username" &>/dev/null || die "User '$username' does not exist"
   is_protected_user "$username" && die "Cannot remove protected user '$username'"
-  
+
   if [[ "$force" != "true" ]]; then
     echo -n "Remove user '$username' and ALL their data? Type the username '$username' to confirm: "
     read -r response
     [[ "$response" == "$username" ]] || die "Operation cancelled - username did not match"
   fi
-  
+
   log "Removing user '$username'..."
-  
+
   # Kill user processes
   log "Checking for running processes..."
   if pgrep -u "$username" &>/dev/null; then
@@ -185,7 +185,7 @@ remove_user() {
     pkill -u "$username" 2>/dev/null || true
     sleep 1
   fi
-  
+
   # Remove user (suppress mail spool warning)
   log "Deleting user and home directory..."
   if ! userdel -r "$username" 2>&1 | grep -v "mail spool"; then
@@ -194,7 +194,7 @@ remove_user() {
       die "Failed to remove user"
     fi
   fi
-  
+
   log "User '$username' removed successfully"
 }
 
@@ -204,7 +204,7 @@ main() {
   local username=""
   local shell="$DEFAULT_SHELL"
   local groups=""
-  local manager_user=""
+  local parent_user=""
   local force="false"
 
   # Parse arguments
@@ -215,7 +215,7 @@ main() {
       --remove) action="remove"; shift ;;
       -s|--shell) shift; shell="$1"; shift ;;
       -g|--groups) shift; groups="$1"; shift ;;
-      -m|--manager) shift; manager_user="$1"; shift ;;
+      -p|--parent) shift; parent_user="$1"; shift ;;
       -f|--force) force="true"; shift ;;
       -*) die "Unknown option: $1" ;;
       *) username="$1"; shift ;;
@@ -227,8 +227,8 @@ main() {
   case "$action" in
     create)
       [[ -n "$username" ]] || die "Username required"
-      [[ -n "$manager_user" ]] || die "Manager user required (--manager)"
-      create_user "$username" "$shell" "$groups" "$manager_user"
+      [[ -n "$parent_user" ]] || die "Parent user required (--parent)"
+      create_user "$username" "$shell" "$groups" "$parent_user"
       ;;
     remove)
       [[ -n "$username" ]] || die "Username required"
